@@ -1,124 +1,139 @@
-# backend/app/services/compliance_engine.py
+import asyncio
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import asyncpg
-from typing import Dict, List, Any
-from sentence_transformers import SentenceTransformer
-import json
-import os
-from ..services.ai_router import AIRouter
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None  # type: ignore
+
 from ..config import settings
+from .ai_router import AIRouter
+
+VECTOR_DIM = 384
+DEFAULT_TOP_K = 5
+SIM_THRESHOLD = 0.25
+EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+TABLES = [
+    "cpsc_recalls",
+    "fda_drug_enforcement",
+    "fda_food_enforcement",
+    "fda_device_data",
+    "fda_drug_labels",
+    "electronics_compliance",
+]
+
+SELECT_CLAUSE = """
+SELECT rule_text, 1 - (embedding <=> $1::vector) AS similarity, severity
+FROM {table}
+ORDER BY embedding <=> $1::vector
+LIMIT $2
+"""
 
 class ComplianceEngine:
     def __init__(self):
+        self._pool: Optional[asyncpg.Pool] = None
+        self._embedder = None
         self.ai_router = AIRouter()
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-        self.neon_url = os.getenv("DATABASE_URL")
-        
-    async def search_compliance_rules(self, text: str, limit: int = 5) -> List[Dict]:
-        """Search for relevant compliance rules using semantic search"""
-        
-        # Create embedding for the product text
-        query_embedding = self.embedder.encode([text])[0].tolist()
-        query_embedding_str = '[' + ','.join(map(str, query_embedding)) + ']'
-        
-        # Connect to Neon
-        conn = await asyncpg.connect(self.neon_url)
-        
-        try:
-            # Semantic search for relevant rules
-            results = await conn.fetch(
-                """
-                SELECT 
-                    rule_text,
-                    source,
-                    severity,
-                    keywords,
-                    metadata,
-                    1 - (embedding <=> $1::vector) as similarity
-                FROM compliance_rules
-                WHERE 1 - (embedding <=> $1::vector) > 0.3  -- Similarity threshold
-                ORDER BY embedding <=> $1::vector
-                LIMIT $2
-                """,
-                query_embedding_str, limit
-            )
-            
-            return [dict(r) for r in results]
-            
-        finally:
-            await conn.close()
-    
-    async def check_compliance(self, text: str, check_type: str = "realtime") -> Dict[str, Any]:
-        """Enhanced compliance check with RAG from Neon"""
-        
-        # Get relevant rules from Neon using RAG
-        relevant_rules = await self.search_compliance_rules(text)
-        
-        # Build context from retrieved rules
-        context = "\n\n".join([
-            f"[{rule['source']} - {rule['severity'].upper()}]: {rule['rule_text']}"
-            for rule in relevant_rules[:3]  # Top 3 most relevant
-        ])
-        
-        # Create structured prompt
-        prompt = f"""You are an e-commerce compliance expert. Analyze this product listing for violations.
 
-RELEVANT COMPLIANCE RULES:
-{context}
+    async def _get_pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            if not settings.DATABASE_URL:
+                raise RuntimeError("DATABASE_URL is not set.")
+            self._pool = await asyncpg.create_pool(dsn=settings.DATABASE_URL)
+        return self._pool
 
-PRODUCT LISTING TO CHECK:
-"{text}"
+    def _get_embedder(self):
+        if self._embedder is None:
+            if SentenceTransformer is None:
+                raise RuntimeError("Install: pip install sentence-transformers")
+            self._embedder = SentenceTransformer(EMB_MODEL)
+        return self._embedder
 
-Analyze for compliance violations based on the rules above. Return ONLY valid JSON:
-{{
-    "compliant": true/false,
-    "violations": ["specific violation 1", "specific violation 2"],
-    "severity": "high/medium/low",
-    "suggestions": ["how to fix violation 1", "how to fix violation 2"],
-    "confidence": 0.0-1.0
-}}"""
-        
-        # Get AI analysis with structured response
-        ai_result = await self.ai_router.get_structured_response(prompt, check_type)
-        
-        # Use parsed response if available, otherwise create default
-        if ai_result.get('parsed'):
-            analysis = ai_result['parsed']
-        else:
-            analysis = {
-                "compliant": True,
-                "violations": ["Could not parse AI response"],
-                "severity": "low",
-                "suggestions": ["Please try again"],
-                "confidence": 0.5
-            }
-        
-        # Calculate compliance score
-        score = 100.0
-        if not analysis.get('compliant'):
-            if analysis.get('severity') == 'high':
-                score -= 40
-            elif analysis.get('severity') == 'medium':
-                score -= 25
-            else:
-                score -= 10
-        
-        score = max(0, score) if not analysis.get('compliant') else 100
-        
+    def _embed(self, text: str) -> List[float]:
+        model = self._get_embedder()
+        v = model.encode(text, normalize_embeddings=True)
+        return [float(x) for x in v]
+
+    @staticmethod
+    def _vector_literal(vec: List[float]) -> str:
+        return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
+    async def _search_table(self, pool: asyncpg.Pool, table: str, emb: List[float], top_k: int) -> List[Dict[str, Any]]:
+        vec = self._vector_literal(emb)
+        sql = SELECT_CLAUSE.format(table=table)
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(sql, vec, top_k)
+        return [{"rule_text": r["rule_text"], "similarity": float(r["similarity"]), "severity": r["severity"]} for r in rows]
+
+    async def _retrieve(self, text: str, table: Optional[str], top_k: int) -> Tuple[List[Dict[str, Any]], float]:
+        pool = await self._get_pool()
+        emb = self._embed(text)
+        if table:
+            rows = await self._search_table(pool, table, emb, top_k)
+            return rows, max((r["similarity"] for r in rows), default=0.0)
+
+        tasks = [self._search_table(pool, t, emb, top_k) for t in TABLES]
+        blocks = await asyncio.gather(*tasks)
+        merged: List[Dict[str, Any]] = []
+        for b in blocks:
+            merged.extend(b)
+        merged.sort(key=lambda r: r["similarity"], reverse=True)
+        merged = merged[:top_k]
+        return merged, max((r["similarity"] for r in merged), default=0.0)
+
+    @staticmethod
+    def _rules_block(rows: List[Dict[str, Any]]) -> str:
+        if not rows:
+            return "RULES:\n- (no relevant rules found)\n"
+        lines = [f"- {r['rule_text']} (sim={r['similarity']:.3f}, sev={r.get('severity')})" for r in rows]
+        return "RULES:\n" + "\n".join(lines) + "\n"
+
+    async def analyze(self, text: str, check_type: Optional[str] = None, table: Optional[str] = None, top_k: int = DEFAULT_TOP_K) -> Dict[str, Any]:
+        t0 = time.time()
+        rows, max_sim = await self._retrieve(text, table, top_k)
+        rules = self._rules_block(rows)
+
+        # LEGACY prompt path for compatibility with previous pipelines
+        prompt = (
+            f"{rules}\n"
+            "TASK: Determine whether the USER content is compliant. If violations exist, list them succinctly.\n"
+            f"USER CONTENT:\n{text}"
+        )
+        parsed = await self.ai_router.legacy_get_structured_response(prompt, model_type=check_type)
+
+        compliant   = bool(parsed.get("compliant", False))
+        violations  = parsed.get("violations", []) or []
+        severity    = (parsed.get("severity") or "low").lower()
+        suggestions = parsed.get("suggestions", []) or []
+        confidence  = float(parsed.get("confidence", 0.0))
+
+        uses_context = bool(max_sim >= SIM_THRESHOLD)
+        top_rules = [r["rule_text"] for r in rows][:top_k]
+        score = float(max_sim)
+        latency_ms = (time.time() - t0) * 1000.0
+
         return {
-            "compliant": analysis.get("compliant", True),
+            "compliant": compliant,
+            "violations": violations,
+            "severity": severity,
+            "suggestions": suggestions,
+            "confidence": confidence,
+            "uses_context": uses_context,
+            "top_rules": top_rules,
             "score": score,
-            "violations": analysis.get("violations", []),
-            "suggestions": analysis.get("suggestions", []),
-            "severity": analysis.get("severity", "low"),
-            "confidence": analysis.get("confidence", 0.5),
-            "relevant_rules": [
-                {
-                    "source": rule["source"],
-                    "similarity": f"{rule['similarity']:.2%}",
-                    "text_preview": rule["rule_text"][:100] + "..."
-                }
-                for rule in relevant_rules[:3]
-            ],
-            "model_used": ai_result["model_used"],
-            "latency_ms": ai_result["latency_ms"]
+            "latency_ms": latency_ms,
         }
+
+    async def check_compliance(self, text: str, check_type: Optional[str] = None) -> Dict[str, Any]:
+        table_map = {
+            "safety": "cpsc_recalls",
+            "drug": "fda_drug_enforcement",
+            "food": "fda_food_enforcement",
+            "device": "fda_device_data",
+        }
+        table = table_map.get((check_type or "").lower(), None)
+        return await self.analyze(text=text, check_type=check_type, table=table, top_k=DEFAULT_TOP_K)

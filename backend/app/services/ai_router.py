@@ -1,149 +1,98 @@
-# backend/app/services/ai_router.py
 import time
 import logging
-import asyncio
-import httpx
-from openai import OpenAI  # NEW: Added OpenAI import
-import google.generativeai as genai
-from typing import Dict, Any
 import json
 import re
+from typing import Dict, Any, Optional, List
+
+from openai import AsyncOpenAI
 from ..config import settings
 
 logger = logging.getLogger(__name__)
+JSON_PATTERN = re.compile(r"\{.*\}", re.S)
 
 class AIRouter:
-    def __init__(self):
-        self.ollama_base = settings.OLLAMA_HOST
-        
-        # NEW: Configure OpenAI
-        if settings.OPENAI_API_KEY:
-            self.openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            self.openai_model = "gpt-4o-mini"
-            logger.info("✅ OpenAI configured successfully")
-        else:
-            logger.warning("⚠️ No OpenAI API key found")
-        
-        # Keep Gemini as fallback
-        if settings.GEMINI_API_KEY:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-            logger.info("✅ Gemini configured as fallback")
-        
-    async def route(self, task_type: str, prompt: str, **kwargs) -> Dict[str, Any]:
-        start_time = time.time()
-        
-        # Route to OpenAI instead of Ollama/Gemini
-        if task_type == "realtime":
-            logger.info("📡 Routing to OpenAI for realtime check...")
-            response = await self.call_openai(prompt)  # CHANGED: call_openai instead of call_local
-            model_used = "gpt-4o-mini"
-        else:
-            logger.info("🌐 Routing to OpenAI for complex analysis...")
-            response = await self.call_openai(prompt)  # CHANGED: call_openai instead of call_gemini
-            model_used = "gpt-4o-mini"
-            
-        return {
-            "response": response,
-            "latency_ms": (time.time() - start_time) * 1000,
-            "model_used": model_used
-        }
-    
-    async def call_openai(self, prompt: str) -> str:  # NEW: Added OpenAI method
-        """Call OpenAI API"""
-        try:
-            logger.info("🔄 Calling OpenAI...")
-            # Run in thread since it's not async
-            response = await asyncio.to_thread(
-                self.openai_client.chat.completions.create,
-                model=self.openai_model,
-                messages=[
-                    {"role": "system", "content": "You are a compliance expert. Provide detailed analysis."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                top_p=0.9
-            )
-            result = response.choices[0].message.content
-            logger.info(f"✅ OpenAI responded: {len(result)} chars")
-            return result
-        except Exception as e:
-            logger.error(f"❌ OpenAI error: {e}")
-            # Fallback to Gemini if OpenAI fails
-            if settings.GEMINI_API_KEY:
-                logger.info("🔄 Falling back to Gemini...")
-                return await self.call_gemini(prompt)
-            else:
-                return f"❌ OpenAI error and no fallback available: {str(e)}"
-    
-    async def call_local(self, prompt: str) -> str:  # KEPT: In case you want to use it later
-        """Call Ollama running locally"""
-        try:
-            logger.info("🔄 Calling Ollama...")
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self.ollama_base}/api/generate",
-                    json={
-                        "model": "llama3.2:3b",
-                        "prompt": prompt,
-                        "stream": False,
-                        "options": {
-                            "temperature": 0.1,
-                            "top_p": 0.9
-                        }
-                    }
-                )
-                response.raise_for_status()
-                result = response.json()["response"]
-                logger.info(f"✅ Ollama responded: {len(result)} chars")
-                return result
-        except Exception as e:
-            logger.error(f"❌ Ollama error: {e}")
-            return await self.call_openai(prompt)  # CHANGED: Fallback to OpenAI
-    
-    async def call_gemini(self, prompt: str) -> str:  # KEPT: As fallback
-        """Call Google Gemini API"""
-        try:
-            if not settings.GEMINI_API_KEY:
-                return "❌ Gemini API key not configured"
-            
-            logger.info("🔄 Calling Gemini...")
-            response = await asyncio.to_thread(
-                self.gemini_model.generate_content, prompt
-            )
-            result = response.text
-            logger.info(f"✅ Gemini responded: {len(result)} chars")
-            return result
-        except Exception as e:
-            error_msg = f"❌ Gemini error: {str(e)}"
-            logger.error(error_msg)
-            return error_msg
-    
-    async def get_structured_response(self, prompt: str, model_type: str = "realtime") -> Dict:
-        """Get AI response in structured JSON format"""
-        structured_prompt = f"""{prompt}
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
+        # Lazy; do not raise here
+        self.api_key = (api_key or settings.OPENAI_API_KEY or "").strip()
+        self.model   = (model or settings.OPENAI_MODEL or "gpt-4o-mini").strip()
+        self._client: Optional[AsyncOpenAI] = None
 
-IMPORTANT: Respond ONLY with valid JSON in this exact format:
-{{
-    "compliant": true/false,
-    "violations": ["violation1", "violation2"],
-    "severity": "high/medium/low",
-    "suggestions": ["suggestion1", "suggestion2"],
-    "confidence": 0.0-1.0
-}}"""
-        
-        result = await self.route(model_type, structured_prompt)
-        
-        # Try to parse JSON from response
+    def _ensure_client(self):
+        if not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY missing. Put it in .env or env var.")
+        if self._client is None:
+            self._client = AsyncOpenAI(api_key=self.api_key)
+
+    async def _chat(self, messages: List[Dict[str, str]], *, json_mode: bool = False) -> str:
+        self._ensure_client()
+        kwargs = {"model": self.model, "messages": messages, "temperature": 0.2}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = await self._client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip()
+
+    # ---------- NEW API ----------
+    async def get_text(
+        self, *, system: str, user: str, model: Optional[str] = None, extras: Optional[dict] = None
+    ) -> str:
+        if model:
+            self.model = model
+        msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        return await self._chat(msgs, json_mode=False)
+
+    async def get_structured_response(
+        self, *, system: str, user: str, json_schema: dict, model: Optional[str] = None, extras: Optional[dict] = None
+    ) -> Dict[str, Any]:
+        if model:
+            self.model = model
+        schema_hint = json.dumps(
+            {"type": "object", "properties": json_schema.get("properties", {}), "required": json_schema.get("required", [])},
+            indent=0,
+        )
+        sys_msg = (
+            f"{system}\n"
+            "You must answer ONLY with valid JSON that conforms to this schema (no extra keys, no text outside JSON):\n"
+            f"{schema_hint}"
+        )
+        msgs = [{"role": "system", "content": sys_msg}, {"role": "user", "content": user}]
+        raw = await self._chat(msgs, json_mode=True)
         try:
-            # Extract JSON from response (in case there's extra text)
-            json_match = re.search(r'\{.*\}', result['response'], re.DOTALL)
-            if json_match:
-                result['parsed'] = json.loads(json_match.group())
-            else:
-                result['parsed'] = None
-        except Exception as e:
-            logger.error(f"Failed to parse JSON response: {e}")
-            result['parsed'] = None
-        
-        return result
+            return json.loads(raw)
+        except Exception:
+            m = JSON_PATTERN.search(raw or "")
+            return json.loads(m.group(0)) if m else {}
+
+    # ---------- LEGACY API (compat) ----------
+    async def legacy_get_text(self, prompt: str) -> str:
+        msgs = [{"role": "user", "content": prompt}]
+        return await self._chat(msgs, json_mode=False)
+
+    async def legacy_get_structured_response(self, prompt: str, model_type: Optional[str] = None) -> Dict[str, Any]:
+        # You can map model_type to a different model if needed; otherwise ignore.
+        schema_req = (
+            "Respond ONLY with valid JSON using exactly these keys: "
+            '{"compliant": <boolean>, "violations": <array of strings>, '
+            '"severity": "high|medium|low|critical", "suggestions": <array of strings>, '
+            '"confidence": <number 0..1> }'
+        )
+        msgs = [{"role": "system", "content": schema_req}, {"role": "user", "content": prompt}]
+        raw = await self._chat(msgs, json_mode=True)
+        try:
+            return json.loads(raw)
+        except Exception:
+            m = JSON_PATTERN.search(raw or "")
+            return json.loads(m.group(0)) if m else {}
+
+# Lazy singleton (optional shims for old imports)
+_router_singleton: Optional[AIRouter] = None
+def _get_router() -> AIRouter:
+    global _router_singleton
+    if _router_singleton is None:
+        _router_singleton = AIRouter()
+    return _router_singleton
+
+async def get_structured_response(*, system: str, user: str, json_schema: dict, model: str, extras: dict | None = None):
+    return await _get_router().get_structured_response(system=system, user=user, json_schema=json_schema, model=model, extras=extras)
+
+async def get_text(*, system: str, user: str, model: str, extras: dict | None = None):
+    return await _get_router().get_text(system=system, user=user, model=model, extras=extras)

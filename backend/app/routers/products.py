@@ -1,27 +1,58 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
-from typing import List
-from ..database import get_db
-from .. import models, schemas
+from datetime import datetime, timezone
+import random
+
+from ..database import SessionLocal
+from .. import models
 
 router = APIRouter()
 
-@router.post("/", response_model=schemas.Product)
-def create_product(product: schemas.ProductCreate, db: Session = Depends(get_db)):
-    db_product = models.Product(**product.dict())
-    db.add(db_product)
-    db.commit()
-    db.refresh(db_product)
-    return db_product
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-@router.get("/", response_model=List[schemas.Product])
-def get_products(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    products = db.query(models.Product).offset(skip).limit(limit).all()
-    return products
+def _mock_scan_and_update(product_id: int):
+    # New session in background task
+    db = SessionLocal()
+    try:
+        prod = db.get(models.Product, product_id)
+        if not prod:
+            return
+        # 80% clear, 20% flagged (low/med/high)
+        if random.random() < 0.2:
+            sev = random.choice(["low", "medium", "high"])
+            score = {"low": 85.0, "medium": 65.0, "high": 40.0}[sev]
+            status = "flagged" if sev in ("medium", "high") else "warning"
+            violations = [{"code": "PKG_WARN", "severity": sev, "msg": "Labeling inconsistency"}]
+        else:
+            score, status, violations = 99.0, "clear", []
+        prod.compliance_score = float(score)
+        prod.compliance_status = status
+        prod.violations = violations          # JSON column/list
+        prod.last_checked = datetime.now(timezone.utc)
+        db.add(prod)
+        db.commit()
+    finally:
+        db.close()
 
-@router.get("/{product_id}", response_model=schemas.Product)
-def get_product(product_id: int, db: Session = Depends(get_db)):
-    product = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if product is None:
+@router.post("/{product_id}/recheck", summary="Trigger compliance re-scan")
+def recheck_product(
+    product_id: int,
+    bg: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    prod = db.get(models.Product, product_id)
+    if not prod:
         raise HTTPException(status_code=404, detail="Product not found")
-    return product
+    # mark as checking immediately
+    prod.compliance_status = "checking"
+    prod.last_checked = datetime.now(timezone.utc)
+    db.add(prod)
+    db.commit()
+    # run mock scan in background
+    bg.add_task(_mock_scan_and_update, product_id=product_id)
+    return {"ok": True, "message": "Scan queued"}

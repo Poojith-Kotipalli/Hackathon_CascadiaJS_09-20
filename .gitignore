@@ -23,9 +23,6 @@ htmlcov/
 .env.production
 .env.development
 *.env
-env/
-venv/
-.hack/
 
 # Database
 *.db
@@ -120,6 +117,3 @@ langflow_db/
 # AG2/Autogen
 .autogen/
 autogen_logs/
-
-# Virtual environment
-hack/
