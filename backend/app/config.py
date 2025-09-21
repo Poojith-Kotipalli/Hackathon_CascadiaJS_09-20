@@ -8,6 +8,7 @@ class Settings:
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
     
     # API Keys
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # NEW: Added OpenAI key
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN")
