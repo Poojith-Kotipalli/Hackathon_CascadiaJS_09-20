@@ -1,0 +1,119 @@
+# Python / Backend
+venv/
+env/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.log
+
+# Environment Variables
+.env
+.env.local
+.env.production
+.env.development
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Large Data Files (your compliance data)
+compliance_data_new/
+regulation_data/
+processed_regulations/
+*.zip
+**/raw/*.json
+# Keep the scripts but not the large JSON files
+!app/scripts/*.py
+
+# Frontend / Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Frontend Build Folders
+frontend/build/
+frontend/dist/
+frontend/.next/
+frontend/out/
+.vercel
+.cache
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Testing
+coverage/
+*.lcov
+.nyc_output
+
+# Temporary Files
+*.tmp
+temp/
+tmp/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Model Files (if you download any)
+*.bin
+*.h5
+*.pkl
+models/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Twilio/API credentials
+*.pem
+*.key
+credentials/
+
+# Langflow
+langflow_db/
+.langflow/
+
+# AG2/Autogen
+.autogen/
+autogen_logs/
